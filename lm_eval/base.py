@@ -198,12 +198,15 @@ class BaseLM(LM):
     # subclass must implement properties vocab_size, eot_token_id, max_gen_toks, batch_size, device, max_length.
     # TODO: enforce this somehow
 
-    def _encode_pair(self, context, continuation):
+    def to_whole(self, context, continuation):
         n_spaces = len(context) - len(context.rstrip())
         if n_spaces > 0:
             continuation = context[-n_spaces:] + continuation
             context = context[:-n_spaces]
-        whole_enc = self.tok_encode(context + continuation)
+        return context + continuation
+
+    def _encode_pair(self, context, continuation):
+        whole_enc = self.tok_encode(self.to_whole(context, continuation))
         context_enc = self.tok_encode(context)
         context_enc_len = len(context_enc)
         continuation_enc = whole_enc[context_enc_len:]
@@ -288,6 +291,15 @@ class BaseLM(LM):
         reordered_requests = re_ord.get_reordered()
         n_reordered_requests = len(reordered_requests)
 
+        texts = []
+        for req in reordered_requests:
+            if req[0] is None:
+                texts.append(None)
+            else:
+                context, continuation = req[0]
+                text = self.to_whole(context, continuation)
+                texts.append(text)
+
         # automatic (variable) batch size detection for vectorization
         # pull longest context sample from request
         def _batch_scheduler(pos):
@@ -301,6 +313,7 @@ class BaseLM(LM):
             print(f"Determined largest batch size: {self.batch_sizes[sched]}")
             return self.batch_sizes[sched]
 
+        i_text = 0
         for chunk in utils.chunks(
             tqdm(reordered_requests, disable=disable_tqdm),
             n=self.batch_size
@@ -365,42 +378,75 @@ class BaseLM(LM):
                 inplens.append(inplen)
 
             batched_inps = torch.cat(inps, dim=0)  # [batch, padding_length]
-            multi_logits = F.log_softmax(
-                self._model_call(batched_inps), dim=-1
-            ).cpu()  # [batch, padding_length, vocab]
+            if self.model == 'tgi':
+                multi_logprobs, greedy_tokens = self._model_call(
+                    batched_inps, texts=None #texts[i_text:i_text+len(batched_inps)]
+                )
+                i_text += len(batched_inps)
 
-            for (cache_key, _, _), logits, inp, inplen, cont_toks in zip(
-                chunk, multi_logits, inps, inplens, cont_toks_list
-            ):
+                for (cache_key, _, _), logprobs, inp, inplen, cont_toks in zip(
+                    chunk, multi_logprobs, inps, inplens, cont_toks_list
+                ):
+    
+                    # Slice to original seq length
+                    contlen = len(cont_toks)
+                    inplen = inplen + (len(logprobs) - padding_length)
+                    logprobs = logprobs[inplen - contlen : inplen]
+    
+                    # Check if per-token argmax is exactly equal to continuation
+                    greedy_tokens = greedy_tokens[0][inplen - contlen : inplen]
+                    greedy_tokens = torch.tensor(greedy_tokens).unsqueeze(0)
+                    cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(
+                        0
+                    )  # [1, seq]
+                    max_equal = (greedy_tokens == cont_toks).all()
+    
+                    # Answer: (log prob, is-exact-match)
+                    answer = (float(sum(logprobs)), bool(max_equal))
+    
+                    # partial caching
+                    if cache_key is not None:
+                        self.cache_hook.add_partial("loglikelihood", cache_key, answer)
+    
+                    res.append(answer)
+            
+            else:
+                multi_logits = F.log_softmax(
+                    self._model_call(batched_inps), dim=-1
+                ).cpu()  # [batch, padding_length, vocab]
 
-                # Slice to original seq length
-                contlen = len(cont_toks)
-                inplen = inplen + (logits.shape[0] - padding_length) # if "virtual tokens" (from prompt tuning) are added, inplen is larger
-                logits = logits[inplen - contlen : inplen].unsqueeze(
-                    0
-                )  # [1, seq, vocab]
-
-                # Check if per-token argmax is exactly equal to continuation
-                greedy_tokens = logits.argmax(dim=-1)
-                cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(
-                    0
-                )  # [1, seq]
-                max_equal = (greedy_tokens == cont_toks).all()
-
-                # Obtain log-probs at the corresponding continuation token indices
-                # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
-                logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(
-                    -1
-                )  # [1, seq]
-
-                # Answer: (log prob, is-exact-match)
-                answer = (float(logits.sum()), bool(max_equal))
-
-                # partial caching
-                if cache_key is not None:
-                    self.cache_hook.add_partial("loglikelihood", cache_key, answer)
-
-                res.append(answer)
+                for (cache_key, _, _), logits, inp, inplen, cont_toks in zip(
+                    chunk, multi_logits, inps, inplens, cont_toks_list
+                ):
+    
+                    # Slice to original seq length
+                    contlen = len(cont_toks)
+                    inplen = inplen + (logits.shape[0] - padding_length) # if "virtual tokens" (from prompt tuning) are added, inplen is larger
+                    logits = logits[inplen - contlen : inplen].unsqueeze(
+                        0
+                    )  # [1, seq, vocab]
+    
+                    # Check if per-token argmax is exactly equal to continuation
+                    greedy_tokens = logits.argmax(dim=-1)
+                    cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(
+                        0
+                    )  # [1, seq]
+                    max_equal = (greedy_tokens == cont_toks).all()
+    
+                    # Obtain log-probs at the corresponding continuation token indices
+                    # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
+                    logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(
+                        -1
+                    )  # [1, seq]
+    
+                    # Answer: (log prob, is-exact-match)
+                    answer = (float(logits.sum()), bool(max_equal))
+    
+                    # partial caching
+                    if cache_key is not None:
+                        self.cache_hook.add_partial("loglikelihood", cache_key, answer)
+    
+                    res.append(answer)
 
         return re_ord.get_original(res)
 

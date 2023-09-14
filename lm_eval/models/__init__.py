@@ -1,5 +1,6 @@
 from . import gpt2
 from . import gpt3
+from . import tgi
 from . import anthropic_llms
 from . import huggingface
 from . import textsynth
@@ -10,6 +11,7 @@ MODEL_REGISTRY = {
     "hf-causal": gpt2.HFLM,
     "hf-causal-experimental": huggingface.AutoCausalLM,
     "hf-seq2seq": huggingface.AutoSeq2SeqLM,
+    "tgi": tgi.TGILM,
     "gpt2": gpt2.GPT2LM,
     "gpt3": gpt3.GPT3LM,
     "anthropic": anthropic_llms.AnthropicLM,
